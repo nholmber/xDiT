@@ -126,6 +126,7 @@ class xFuserArgs:
     cross_attention_backend: Optional[str] = None
     use_fp8_gemms: bool = False
     use_fp4_gemms: bool = False
+    fp4_gemm_backend: str = "torchao"
     # Model runner specific
     num_iterations: int = 1
     profile: bool = False
@@ -574,6 +575,13 @@ class xFuserArgs:
             "--use_fp4_gemms",
             action="store_true",
             help="Quantize the transformer linear layers (selected models only).",
+        )
+        parser.add_argument(
+            "--fp4_gemm_backend",
+            type=str,
+            default="torchao",
+            choices=["torchao", "flashinfer"],
+            help="Backend for FP4 GEMM quantization on CUDA: 'torchao' (MSLK via torchao) or 'flashinfer' (mm_fp4).",
         )
 
         parser.add_argument(

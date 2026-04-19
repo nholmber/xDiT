@@ -280,6 +280,131 @@ def quantize_linear_layers_to_nvfp4(
         f"{skipped_fp8_count} overridden to FP8, {skipped_small_count} skipped (too small)")
 
 
+class FlashinferFP4Linear(torch.nn.Module):
+    """Drop-in nn.Linear replacement using flashinfer mm_fp4.
+
+    Weight is quantized to NVFP4 at construction time.  Activation is quantized
+    dynamically on each forward call.  The global scale-factor computation is
+    compiled so it fuses with surrounding ops under torch.compile.
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.has_bias = bias
+
+    @staticmethod
+    def from_linear(linear: torch.nn.Linear) -> "FlashinferFP4Linear":
+        from flashinfer import nvfp4_quantize, SfLayout
+
+        mod = FlashinferFP4Linear(linear.in_features, linear.out_features,
+                                  bias=linear.bias is not None)
+        w = linear.weight.data.to(dtype=torch.bfloat16)
+        maxabs = w.float().abs().nan_to_num().max()
+        maxabs = torch.maximum(maxabs, torch.tensor(1e-12, device=w.device))
+        global_sf_w = (448.0 * 6.0) / maxabs
+        w_fp4, w_sf = nvfp4_quantize(w, global_sf_w,
+                                      sfLayout=SfLayout.layout_128x4, do_shuffle=False)
+        mod.register_buffer("global_sf_w", global_sf_w)
+        mod.register_buffer("w_fp4", w_fp4)
+        mod.register_buffer("w_sf", w_sf)
+        if linear.bias is not None:
+            mod.register_buffer("bias", linear.bias.data.clone())
+        return mod
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from flashinfer import mm_fp4, nvfp4_quantize, SfLayout
+
+        orig_shape = x.shape
+        x2d = x.reshape(-1, self.in_features).contiguous()
+        if x2d.dtype != torch.bfloat16:
+            x2d = x2d.to(torch.bfloat16)
+
+        maxabs = x2d.float().abs().nan_to_num().max()
+        maxabs = torch.maximum(maxabs, torch.tensor(1e-12, device=x2d.device))
+        sf_a = (448.0 * 6.0) / maxabs
+        a_fp4, a_sf = nvfp4_quantize(x2d, sf_a,
+                                      sfLayout=SfLayout.layout_128x4, do_shuffle=False)
+        alpha = 1.0 / (sf_a * self.global_sf_w)
+        out = mm_fp4(a_fp4, self.w_fp4.T, a_sf, self.w_sf.T, alpha,
+                     torch.bfloat16, block_size=16, use_8x4_sf_layout=False,
+                     backend="cutlass")
+
+        if self.has_bias:
+            out = out + self.bias
+
+        return out.reshape(*orig_shape[:-1], self.out_features)
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.has_bias}"
+
+
+def quantize_linear_layers_to_flashinfer_fp4(
+    module_or_module_list_to_quantize: torch.nn.Module | torch.nn.ModuleList,
+    fp8_layers: tuple[str] = None,
+    device: Optional[torch.device] = None,
+) -> None:
+    """Replace nn.Linear layers with FlashinferFP4Linear using flashinfer mm_fp4."""
+
+    if isinstance(module_or_module_list_to_quantize, torch.nn.Module):
+        module_or_module_list_to_quantize = [module_or_module_list_to_quantize]
+
+    quantized_count = 0
+    skipped_fp8_count = 0
+
+    for module in module_or_module_list_to_quantize:
+        for fqn, submodule in list(module.named_modules()):
+            if not isinstance(submodule, torch.nn.Linear):
+                continue
+            if fp8_layers and fqn.startswith(fp8_layers):
+                skipped_fp8_count += 1
+                continue
+            quantized_count += 1
+
+        for name, child in list(module.named_children()):
+            if isinstance(child, torch.nn.Linear):
+                if fp8_layers and name.startswith(fp8_layers):
+                    continue
+                replacement = FlashinferFP4Linear.from_linear(child)
+                setattr(module, name, replacement)
+            else:
+                _replace_linears_recursive(child, fp8_layers, prefix=name)
+
+    if fp8_layers:
+        from torchao.quantization.granularity import PerTensor
+        from torchao.quantization.quant_api import (
+            Float8DynamicActivationFloat8WeightConfig, quantize_, _is_linear,
+        )
+        fp8_config = Float8DynamicActivationFloat8WeightConfig(
+            granularity=PerTensor(),
+            set_inductor_config=False,
+            kernel_preference=_get_fp8_kernel_preference(),
+        )
+        for module in module_or_module_list_to_quantize:
+            def fp8_filter_fn(mod, fqn):
+                if not _is_linear(mod, fqn):
+                    return False
+                return fqn.startswith(fp8_layers)
+            quantize_(module, config=fp8_config, filter_fn=fp8_filter_fn, device=device)
+
+    log(f"  [FlashinferFP4] Summary: {quantized_count} layers quantized to FP4, "
+        f"{skipped_fp8_count} overridden to FP8")
+
+
+def _replace_linears_recursive(module: torch.nn.Module, fp8_layers: tuple = None, prefix: str = ""):
+    """Recursively replace nn.Linear with FlashinferFP4Linear."""
+    for name, child in list(module.named_children()):
+        fqn = f"{prefix}.{name}" if prefix else name
+        if isinstance(child, torch.nn.Linear):
+            if fp8_layers and fqn.startswith(fp8_layers):
+                continue
+            replacement = FlashinferFP4Linear.from_linear(child)
+            setattr(module, name, replacement)
+        else:
+            _replace_linears_recursive(child, fp8_layers, prefix=fqn)
+
+
 def convert_model_convs_to_channels_last(model: torch.nn.Module) -> None:
     """
     Manually convert 2D and 3D convolutional layer weights to channels_last format.

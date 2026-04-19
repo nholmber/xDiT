@@ -20,6 +20,7 @@ from xfuser.core.utils.runner_utils import (
     quantize_linear_layers_to_fp8,
     quantize_linear_layers_to_fp4,
     quantize_linear_layers_to_nvfp4,
+    quantize_linear_layers_to_flashinfer_fp4,
     convert_model_convs_to_channels_last,
     rgetattr,
 )
@@ -470,7 +471,11 @@ class xFuserModel(abc.ABC):
         if self.config.use_fp4_gemms:
             from xfuser.envs import _is_cuda
             if _is_cuda():
-                self._setup_nvfp4_gemms(local_rank=local_rank)
+                backend = getattr(self.config, "fp4_gemm_backend", "torchao")
+                if backend == "flashinfer":
+                    self._setup_flashinfer_fp4_gemms(local_rank=local_rank)
+                else:
+                    self._setup_nvfp4_gemms(local_rank=local_rank)
             else:
                 self._setup_mxfp4_gemms(local_rank=local_rank)
         elif self.config.use_fp8_gemms:
@@ -543,6 +548,24 @@ class xFuserModel(abc.ABC):
                 log(f"The following blocks will use FP8 instead, to maintain output quality: {self.settings.fp8_precision_overrides}")
             module = rgetattr(self.pipe, module_name)
             quantize_linear_layers_to_nvfp4(
+                module,
+                fp8_layers=self.settings.fp8_precision_overrides,
+                device=f"cuda:{local_rank}",
+            )
+        for module_name in self.settings.fp8_gemm_module_list:
+            if module_name in self.settings.fp4_gemm_module_list:
+                continue
+            log(f"Quantizing linear layers in {module_name} to FP8...")
+            module = rgetattr(self.pipe, module_name)
+            quantize_linear_layers_to_fp8(module, device=f"cuda:{local_rank}")
+
+    def _setup_flashinfer_fp4_gemms(self, local_rank):
+        for module_name in self.settings.fp4_gemm_module_list:
+            log(f"Quantizing linear layers in {module_name} to FP4 (flashinfer mm_fp4)...")
+            if self.settings.fp8_precision_overrides:
+                log(f"The following blocks will use FP8 instead: {self.settings.fp8_precision_overrides}")
+            module = rgetattr(self.pipe, module_name)
+            quantize_linear_layers_to_flashinfer_fp4(
                 module,
                 fp8_layers=self.settings.fp8_precision_overrides,
                 device=f"cuda:{local_rank}",
