@@ -43,9 +43,20 @@ def quantize_qk_to_fp4(
     """
     batch, seqlen, nheads, headdim = tensor.shape
 
+    # nvfp4_quantize pads M (first dim) to the next multiple of 128.
+    # When batch > 1 and we flatten as (batch * seqlen, K), the padding is
+    # appended once at the end rather than per-batch, making the output
+    # impossible to reshape back to (batch, ...).  Fix: pad seqlen explicitly
+    # so that batch * padded_seqlen == the padded output M dimension.
+    padded_seqlen = math.ceil(seqlen / 128) * 128
+    if padded_seqlen != seqlen:
+        tensor = torch.nn.functional.pad(
+            tensor, (0, 0, 0, 0, 0, padded_seqlen - seqlen)
+        )
+
     global_sf = torch.ones(1, device=tensor.device, dtype=torch.float32)
     fp4_data, sf_data = nvfp4_quantize(
-        tensor.reshape(batch * seqlen, nheads * headdim),
+        tensor.reshape(batch * padded_seqlen, nheads * headdim),
         global_sf,
         sfLayout=SfLayout.layout_128x4,
         do_shuffle=False,
@@ -53,13 +64,14 @@ def quantize_qk_to_fp4(
 
     fp4 = (
         fp4_data
-        .reshape(batch, seqlen, nheads, headdim // 2)
+        .reshape(batch, padded_seqlen, nheads, headdim // 2)
         .view(torch.int8)
         .view(torch.float4_e2m1fn_x2)
     )
+    if padded_seqlen != seqlen:
+        fp4 = fp4[:, :seqlen, :, :].contiguous()
 
-    # nvfp4_quantize pads M to next multiple of 128 internally
-    rest_m = math.ceil(seqlen / 128)
+    rest_m = padded_seqlen // 128
     sf_kph = headdim // sf_vec_size
     rest_k = sf_kph // 4
     total_m = batch * rest_m
