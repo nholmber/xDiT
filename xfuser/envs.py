@@ -293,12 +293,9 @@ class PackagesEnvChecker:
         sys.modules["flash_attn_3.flash_attn_interface"] = _fai
 
     def check_transformer_engine(self):
-        import sys
         if not torch.cuda.is_available() or _is_hip():
             return False
         self._install_flash_attn_3_shim_for_transformer_engine()
-        if "flash_attn_3.flash_attn_interface" not in sys.modules:
-            return False
         try:
             from transformer_engine.pytorch import DotProductAttention, fp8_autocast  # noqa: F401
             from transformer_engine.common import recipe # noqa: F401
