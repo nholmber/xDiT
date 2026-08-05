@@ -94,6 +94,8 @@ Individual model classes that inherit from `xFuserModel`:
 | Wan 2.1/2.2 I2V | `Wan2.1-I2V`, `Wan2.2-I2V`, `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers`, `Wan-AI/Wan2.2-I2V-A14B-Diffusers` |
 | Wan 2.2 Distilled I2V (LightX2V 4-step) | `Wan2.2-Distilled-I2V` |
 | Wan 2.1/2.2 T2V | `Wan2.1-T2V`, `Wan2.2-T2V`, `Wan-AI/Wan2.1-T2V-14B-720P-Diffusers`, `Wan-AI/Wan2.2-T2V-A14B-Diffusers` |
+| Wan 2.2 S2V | `Wan2.2-S2V`, `Wan-AI/Wan2.2-S2V-14B` |
+| Wan-Dancer | `Wan-Dancer-14B`, `Wan-AI/Wan-Dancer-14B` |
 | Wan 2.1 VACE | `Wan2.1-VACE-14B`, `Wan2.1-VACE-1.3B`, `Wan-AI/Wan2.1-VACE-14B`, `Wan-AI/Wan2.1-VACE-1.3B` |
 | Stable Diffusion 3 | `SD3.5`, `stabilityai/stable-diffusion-3.5-large` |
 | Z-Image-Turbo | `Z-Image-Turbo`, `Tongyi-MAI/Z-Image-Turbo` |
@@ -146,6 +148,8 @@ Individual model classes that inherit from `xFuserModel`:
 | `--max_sequence_length` | Maximum sequence length | Model-specific |
 | `--seed` | Random seed for reproducibility | 42 |
 | `--input_images` | Input image paths for image-to-image/video | [] |
+| `--input_audio` | Input audio path for audio-conditioned models | None |
+| `--input_video` | Optional input or pose video path | None |
 
 ### Optimization Options
 
@@ -206,6 +210,48 @@ xdit --model HunyuanVideo \
     --height 720 \
     --width 1280 \
     --num_frames 49 \
+    --ulysses_degree 8
+```
+
+### Audio-Conditioned Wan Generation
+
+Wan2.2-S2V uses the official Wan2.2 repository. Install the optional
+dependencies and point xDiT at a checkout:
+
+```bash
+git clone https://github.com/Wan-Video/Wan2.2.git
+git -C Wan2.2 checkout 42bf4cf
+pip install -e ".[wan-audio]"
+export WAN22_REPO_PATH=$PWD/Wan2.2
+
+xdit --model Wan2.2-S2V \
+    --prompt "A singer performing on stage" \
+    --input_images reference.jpg \
+    --input_audio speech.wav \
+    --ulysses_degree 8
+```
+
+Wan-Dancer similarly uses the official Wan-Dancer repository. Run the global
+stage first, then use its output as `--input_video` for local refinement:
+
+```bash
+git clone https://github.com/Wan-Video/Wan-Dancer.git
+git -C Wan-Dancer checkout e6c87a9
+export WAN_DANCER_REPO_PATH=$PWD/Wan-Dancer
+
+xdit --model Wan-Dancer-14B \
+    --task global \
+    --prompt "A cinematic K-pop dance performance" \
+    --input_images dancer.jpg \
+    --input_audio music.wav \
+    --ulysses_degree 8
+
+xdit --model Wan-Dancer-14B \
+    --task local \
+    --prompt "A cinematic K-pop dance performance" \
+    --input_images dancer.jpg \
+    --input_audio music.wav \
+    --input_video global_video.mp4 \
     --ulysses_degree 8
 ```
 

@@ -59,6 +59,18 @@ if __name__ == "__main__":
             "opencv-python": [
                 "opencv-python-headless", # NOTE: opencv-python is necessary if ConsisIDPipeline is used
             ],
+            "wan-audio": [
+                "easydict",
+                "decord",
+                "librosa",
+                "loguru",
+                "modelscope",
+                "moviepy",
+                "opencv-python-headless",
+                "pynvml",
+                "scipy",
+                "soundfile",
+            ],
             "test": [
                 "pytest",
                 "imageio",

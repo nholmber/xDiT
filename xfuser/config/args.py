@@ -150,6 +150,8 @@ class xFuserArgs:
     warmup_calls: int = 0
     output_directory: str = "."
     input_images: Optional[List[str]] = None
+    input_audio: Optional[str] = None
+    input_video: Optional[str] = None
     resize_input_images: bool = False
     task: Optional[str] = None
     batch_size: Optional[int] = None
@@ -688,6 +690,16 @@ class xFuserArgs:
             default=[],
             nargs="+",
             help="Path(s)/URL(s) to input image(s).",
+        )
+        parser.add_argument(
+            "--input_audio",
+            default=None,
+            help="Path to an input audio file for audio-conditioned models.",
+        )
+        parser.add_argument(
+            "--input_video",
+            default=None,
+            help="Path to an optional input or pose video.",
         )
         parser.add_argument(
             "--resize_input_images",

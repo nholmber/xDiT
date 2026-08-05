@@ -1003,9 +1003,10 @@ class ExternalRuntimeState(RuntimeState):
     This can be used to test individual components in tests without
     having to setup a full distributed environment.
     """
-    def __init__(self):
-        # Creating config with default params
-        config, _ = xFuserArgs().create_config()
+    def __init__(self, config: Optional[EngineConfig] = None):
+        if config is None:
+            # Creating config with default params
+            config, _ = xFuserArgs().create_config()
         super().__init__(config)
 
 
@@ -1038,5 +1039,4 @@ def initialize_runtime_state(pipeline: Optional[DiffusionPipeline] = None, engin
     elif hasattr(pipeline, "unet"):
         _RUNTIME = UnetRuntimeState(pipeline=pipeline, config=engine_config)
     elif not pipeline:
-        _RUNTIME = ExternalRuntimeState()
-
+        _RUNTIME = ExternalRuntimeState(config=engine_config)
