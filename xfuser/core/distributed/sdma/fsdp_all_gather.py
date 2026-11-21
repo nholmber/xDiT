@@ -24,7 +24,7 @@ from xfuser.logger import init_logger
 
 logger = init_logger(__name__)
 
-_MAX_CHUNKS = 8  # pieces per pair all-gather (two parities' channels, and two sends each, within a call's limits)
+_MAX_CHUNKS = 8  # pieces per pair all-gather: 2R signal phases x 8 pieces fill the 64 channels
 _ROW_BYTES = 4096  # the shard is gathered as rows of this many bytes (padded to whole rows)
 calls = {"sdma": 0}
 # The calls of every module share one inbox (per group), but FSDP roots (each transformer) have their own
@@ -103,7 +103,7 @@ class PairAllGather(AllGather):
     resident wait wave makes a GEMM launched one work-group per CU run a second round):
 
     - Send (all-gather stream): the shard goes in pieces into the partner's inbox region (call n uses region
-      n % R, R = transport._SLOTS), the share XDIT_FSDP_SDMA_RELAY_FRACTION (default 0.375; 0: all direct) through a
+      n % R, R = pull_relay._CREDITS), the share XDIT_FSDP_SDMA_RELAY_FRACTION (default 0.375; 0: all direct) through a
       buffer on a third GPU that the partner's engine pulls once released. Each piece's pushes wait in the engine
       for the stream (trigger) and for that (region, piece)'s credit.
     - Receive (compute stream, in the returned Work's wait(), which FSDP calls before its copy-out): wait for each
@@ -123,47 +123,62 @@ class PairAllGather(AllGather):
 
         fraction = float(os.environ.get("XDIT_FSDP_SDMA_RELAY_FRACTION", "0.375"))
         pair = pull_relay.pair_for(group, tag="fsdp", fraction=fraction)
-        R = transport._SLOTS
+        R = pull_relay._CREDITS  # inbox regions and credits, by call number mod R; R / 2 gathers in flight
         me = group.rank()
         nbytes = input_tensor.numel() * input_tensor.element_size()
         out = output_tensor.view(torch.uint8).view(2, nbytes)
         src = out[me] if out[me].data_ptr() == input_tensor.data_ptr() else input_tensor.contiguous().view(torch.uint8).view(-1)
         rb = -(-nbytes // 256) * 256
-        inbox = pair.buffer("inbox", R * rb)
+        # One inbox per gather size: re-allocating a shared one when a larger module comes along would free memory
+        # an earlier gather (FSDP prefetches ahead; the small root unit first) has not been copied out of yet.
+        inbox = pair.buffer(f"inbox_{nbytes}", R * rb)
         chunks = max(1, min(int(os.environ.get("XDIT_FSDP_SDMA_CHUNKS", "4")), _MAX_CHUNKS, nbytes // (1 << 20) or 1))
         piece = -(-nbytes // chunks // 256) * 256
         bounds = [(c * piece, min((c + 1) * piece, nbytes)) for c in range(chunks) if c * piece < nbytes]
-        region = pair.calls % R  # the call slot begin() takes next
+        # Call n uses inbox region n % R, pull-signal channels of phase n % R, and credit n % R. An engine re-arms a
+        # credit or pull signal as its last copy, after the flag the receiver acts on, so a release triggered by that
+        # flag could overtake the re-arm and be lost. Hence: copy-out of call m releases the credit of push m + R/2,
+        # whose previous re-arm (after push m - R/2) ran on the sender's engine before push m's data, which the
+        # copy-out needed; and a call's pull signal is next released by push m + R, which needs the credit from the
+        # copy-out of m + R/2, after this rank's pulls of m + R/2, which its pull engine runs after the re-arm.
+        phase = pair.calls % R
+        region = phase
         routes = [
             pair.route(
-                ("fsdp_ag", nbytes, len(bounds), c, region),
+                ("fsdp_ag", nbytes, len(bounds), c, phase),
                 lambda lo=lo, hi=hi: [[(lo, inbox, region * rb + lo, hi - lo)]],
-                region * _MAX_CHUNKS + c,
-                credit=c,
+                phase * _MAX_CHUNKS + c,
+                credit=(c, phase),
                 lane=("fsdp_ag", nbytes, len(bounds), c),
             )
             for c, (lo, hi) in enumerate(bounds)
         ]
         call = pair.begin()
-        assert call.index == region
+        assert call.index == phase % pull_relay._RSLOTS
         stream = torch.cuda.current_stream()
         for route in routes:
             call.send(route, src, stream)
         call.end()
-        pair.fsdp_held = (getattr(pair, "fsdp_held", []) + [output_tensor])[-(R + 2):]
+        # This rank's pushes of call n are done before the partner's copy-out of n releases credit n + R/2.
+        pair.fsdp_held = (getattr(pair, "fsdp_held", []) + [output_tensor])[-(R // 2 + 2):]
         calls["pull"] = calls.get("pull", 0) + 1
+        n_call = pair.calls - 1
         mine = inbox.local[region * rb : region * rb + nbytes]
-        credits = [pair.credits(c) for c in range(len(bounds))]
+        # Every piece index's credits, whatever this call's piece count (a small unit gathers in fewer pieces than the
+        # next call may need released): created together on the first call (pair-collective), released together.
+        credits = [pair.credits(c) for c in range(_MAX_CHUNKS)]
 
         def finish():
             cur = torch.cuda.current_stream()
             for c, (lo, hi) in enumerate(bounds):
-                call.wait(region * _MAX_CHUNKS + c, cur)
+                call.wait(phase * _MAX_CHUNKS + c, cur)
                 out[1 - me, lo:hi].copy_(mine[lo:hi])
-            # The region is free again: release the partner's credits for it (a store into its exported signals).
+            # Region of call n_call + R/2's predecessor is free: release the partner's credits for push n_call + R/2
+            # (a store into its exported signals).
+            k = (n_call + R // 2) % R
             for direct, relayed in credits:
                 for ids, _, theirs in (direct, relayed):
-                    transport.device_bytes(theirs[region], 8, out.device).view(torch.int64).zero_()
+                    transport.device_bytes(theirs[k], 8, out.device).view(torch.int64).zero_()
 
         return _OnCompute(finish)
 

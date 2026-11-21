@@ -47,6 +47,10 @@ from xfuser.logger import init_logger
 logger = init_logger(__name__)
 
 _ALIGN = 256
+# Calls a relay instance keeps in flight (bounce regions, pull signals): its own ring, not the transport's call slots.
+_RSLOTS = 4
+# Credit signals per credit index (FSDP): twice what a sender keeps in flight, see fsdp_all_gather.py.
+_CREDITS = 8
 _pairs: Dict[tuple, "PullRelayPair"] = {}
 
 
@@ -92,7 +96,7 @@ class _Route:
         self.buffers = buffers
         self.push: List[tuple] = []
         self.pull: List[int] = []
-        self.credit: Optional[int] = None
+        self.credit: Optional[Tuple[int, int]] = None
 
     @property
     def live(self) -> bool:
@@ -238,13 +242,13 @@ class PullRelayPair:
         self._bump += nbytes
         return cur
 
-    def _exported_signals(self, initial_zero: bool) -> tuple:
-        """One GPU-only signal per call slot on this rank, its memory exported, and the partner's attached
-        (pair-collective): (ids, local value addresses, partner's value addresses)."""
+    def _exported_signals(self, initial: Optional[List[int]] = None) -> tuple:
+        """GPU-only signals on this rank (one per call slot, or one per value of `initial`), their memory exported, and
+        the partner's attached (pair-collective): (ids, local value addresses, partner's value addresses)."""
         lib = transport.load()
         hs = lib.sx_hsa_ipc_handle_size()
         ids, mine, exports = [], [], []
-        for _ in range(transport._SLOTS):
+        for k in range(_RSLOTS if initial is None else len(initial)):
             h, nb, off, v = (ctypes.c_uint8 * hs)(), ctypes.c_uint64(), ctypes.c_uint64(), ctypes.c_uint64()
             sid = lib.sx_signal_create_gpu_exported(h, ctypes.byref(nb), ctypes.byref(off), ctypes.byref(v))
             if sid < 0:
@@ -252,8 +256,8 @@ class PullRelayPair:
             ids.append(sid)
             mine.append(v.value)
             exports.append((bytes(h), nb.value, off.value))
-            if initial_zero:
-                transport.device_bytes(v.value, 8, self.p.device).view(torch.int64).zero_()
+            if initial is not None:  # signals start at 1
+                transport.device_bytes(v.value, 8, self.p.device).view(torch.int64).fill_(initial[k])
         torch.cuda.synchronize()
         every = [None, None]
         dist.all_gather_object(every, exports, group=self.p.process_group)
@@ -265,13 +269,14 @@ class PullRelayPair:
         return ids, mine, theirs
 
     def credits(self, index: int) -> tuple:
-        """Credit `index`'s signals (pair-collective on first use): per call slot, one per push engine (direct,
-        relayed), each starting free (0). A push gated on its credit waits in the engine until the receiver has
-        released it (written 0 into the partner's copy, `theirs`), then sets it back to 1 as its engine's last copy.
-        ((direct ids, mine, theirs), (relayed ids, mine, theirs))."""
+        """Credit `index`'s signals (pair-collective on first use): _CREDITS per push engine (direct, relayed), the
+        first _CREDITS // 2 free (0), the rest taken (1). A push gated on credit k waits in the engine until the
+        receiver has released it (written 0 into its copy, `theirs`), then sets it back to 1 as its engine's last copy
+        ((direct ids, mine, theirs), (relayed ids, mine, theirs)). fsdp_all_gather.py says who releases which."""
         got = self._credits.get(index)
         if got is None:
-            got = self._credits[index] = (self._exported_signals(True), self._exported_signals(True))
+            initial = [0] * (_CREDITS // 2) + [1] * (_CREDITS // 2)
+            got = self._credits[index] = (self._exported_signals(initial), self._exported_signals(initial))
         return got
 
     def _signals(self, channel: int) -> tuple:
@@ -281,11 +286,12 @@ class PullRelayPair:
         exported with hsa_amd_ipc_memory_create so the partner's engine can write it."""
         got = self._sigs.get(channel)
         if got is None:
-            got = self._sigs[channel] = self._exported_signals(False)
+            got = self._sigs[channel] = self._exported_signals()
         return got
 
-    def route(self, key, build, signal, credit: Optional[int] = None, lane=None):
-        """interface.PeerTransport.route; `credit` (FSDP): gate this route's pushes on credits(credit); `lane`: the
+    def route(self, key, build, signal, credit: Optional[Tuple[int, int]] = None, lane=None):
+        """interface.PeerTransport.route; `credit` (FSDP, (index, k)): gate this route's pushes on credit k of
+        credits(index); `lane`: the
         bounce lane key, when routes that are never in flight in the same call slot may share one (FSDP: a call's
         inbox region is its slot)."""
         cached = self._routes.get((key, signal))
@@ -314,15 +320,15 @@ class PullRelayPair:
         their_cut, their_bytes = cut(theirs)
         per_slot = max(own_bytes, their_bytes, _ALIGN)
         lane_key = lane if lane is not None else (key[1:] if isinstance(key, tuple) and len(key) > 1 else key, signal)
-        lane = self._lane(lane_key, transport._SLOTS * per_slot)
+        lane = self._lane(lane_key, _RSLOTS * per_slot)
         buffers = list({id(c[1]): c[1] for c in own + theirs}.values())
         r = _Route(signal, lane, buffers)
         fl = self.flags
         sig = None if signal is None else self._signals(signal)
-        cr = None if credit is None else self.credits(credit)
+        cr = None if credit is None else self.credits(credit[0])
         r.credit = credit
         one, zero = self.one.data_ptr(), self.zero.data_ptr()
-        for slot in range(transport._SLOTS):
+        for slot in range(_RSLOTS):
             base = slot * per_slot
             direct = [(src, dst.peer_bases[0] + dst_off, d) for src, dst, dst_off, d, _, _ in own_cut]
             relayed = [(src + d, lane.theirs + base + at, n) for src, _, _, d, n, at in own_cut if n]
@@ -332,8 +338,8 @@ class PullRelayPair:
             d_tail = [] if sig is None else [(one, fl.peer_bases[0] + signal * 8, 4)]
             r_tail = [] if sig is None else [(zero, sig[2][slot], 4)]
             if cr is not None:
-                d_tail.append((one, cr[0][1][slot], 4))
-                r_tail.append((one, cr[1][1][slot], 4))
+                d_tail.append((one, cr[0][1][credit[1]], 4))
+                r_tail.append((one, cr[1][1][credit[1]], 4))
             r.push.append(
                 (
                     _plan([self.e_direct], [direct], None),
@@ -353,7 +359,7 @@ class PullRelayPair:
         return r
 
     def begin(self) -> "PullRelayCall":
-        index = self.calls % transport._SLOTS
+        index = self.calls % _RSLOTS
         self.calls += 1
         return PullRelayCall(self, self.p.begin(), index)
 
@@ -395,14 +401,14 @@ class PullRelayCall:
             raise ValueError(f"at most {transport._TRIGGERS} sends per call")
         lib = transport.load()
         d_data, d_tail, r_data, r_tail = route.push[slot]
-        credit = None if route.credit is None else pair.credits(route.credit)
+        credit = None if route.credit is None else pair.credits(route.credit[0])
         for plan, base, engine in ((d_data, src.data_ptr(), 0), (d_tail, 0, 0), (r_data, src.data_ptr(), 1), (r_tail, 0, 1)):
             if plan is None:
                 continue
             if credit is None:
                 rc = lib.sx_plan_issue(c.slot, c._sends, plan, base, 0)
             else:
-                rc = lib.sx_plan_issue_trigger_dep(c.slot, c._sends, plan, base, 0, credit[engine][0][slot])
+                rc = lib.sx_plan_issue_trigger_dep(c.slot, c._sends, plan, base, 0, credit[engine][0][route.credit[1]])
             transport._check(rc, "sx_plan_issue")
         transport._check(lib.sx_release(c.slot, c._sends, ctypes.c_void_p(stream.cuda_stream)), "sx_release")
         c._sends += 1
