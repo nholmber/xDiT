@@ -185,6 +185,7 @@ def load():
         "sx_hsa_ipc_attach": [vp, u64, u64p],
         "sx_wait_flags": [vp, u64, i, i, dbl, i, i, i],
         "sx_wait_flags_cp": [vp, u64, i, i],
+        "sx_wait_ge": [vp, u64, u64, i, i],
         "sx_take_error": [ip, ip, u64p],
         "sx_peek_error": [ip, ip, u64p],
         "sx_debug_drop_flag": [i, i, i],

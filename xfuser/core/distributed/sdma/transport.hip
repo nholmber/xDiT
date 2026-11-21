@@ -150,6 +150,15 @@ __global__ void wait_flags(int* words, int count, int skip, unsigned long long b
   __threadfence_system();
 }
 
+// Spins until words[idx[i]] >= target for every i < n (acquire, system scope): the TP relay's counter flags (call
+// numbers, never reset). One thread; launched from C (sx_wait_ge), a few microseconds of host time where a Triton
+// launch costs ~50.
+__global__ void wait_ge(const int* words, const int* idx, int n, int target) {
+  for (int i = 0; i < n; ++i)
+    while (__hip_atomic_load(words + idx[i], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < target)
+      __builtin_amdgcn_s_sleep(2);
+}
+
 // Launched once at init: fails to launch if the library has no code object for this GPU.
 __global__ void probe(int* word) { *word = 0; }
 
@@ -581,6 +590,12 @@ int sx_wait_flags_cp(hipStream_t stream, uint64_t words, int count, int skip) {
   for (int i = 0; i < count; ++i)
     if (i != skip && hipStreamWriteValue32(stream, (void*)(words + 4ull * i), 0, 0) != hipSuccess) return -2;
   return 0;
+}
+
+// Enqueues on `stream` a wait until words[idx[i]] >= target for every i < n (`idx`: n int32 on the device).
+int sx_wait_ge(hipStream_t stream, uint64_t words, uint64_t idx, int n, int target) {
+  hipLaunchKernelGGL(wait_ge, dim3(1), dim3(1), 0, stream, (const int*)words, (const int*)idx, n, target);
+  return hipGetLastError() == hipSuccess ? 0 : -1;
 }
 
 // As sx_take_error, without clearing the record: for a watchdog that polls it.
