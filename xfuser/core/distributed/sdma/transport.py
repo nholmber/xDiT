@@ -70,8 +70,9 @@ logger = init_logger(__name__)
 # GPU architectures the transport is validated on; others need XDIT_SDMA_ALLOW_UNTESTED=1.
 VALIDATED_ARCHS = ("gfx942", "gfx950")
 # Call slots: a call's copies take a slot's signals, and reusing a slot waits on the host for the copies of its
-# previous call (XDIT_SDMA_CALL_SLOTS; the TP relay's pull mode hangs with 16).
-_SLOTS = int(os.environ.get("XDIT_SDMA_CALL_SLOTS", "4"))
+# previous call. Keep 4: the relays rely on that host pacing (with 16, the FSDP pair all-gather produced wrong
+# weights end to end and the TP relay's pull mode hung).
+_SLOTS = 4
 _INITIAL_COPIES = 256  # signals per slot to start with; a slot grows when a call needs more
 _TRIGGERS = 32  # sends per call (kTriggers in transport.hip)
 _CHANNELS = 64
