@@ -255,6 +255,22 @@ int sx_malloc(uint64_t bytes, int uncached, uint64_t* out) {
 
 int sx_free(uint64_t ptr) { return hipFree((void*)ptr) == hipSuccess ? 0 : -1; }
 
+// As sx_malloc, zeroed, on GPU `dev` rather than this process's own (a relay GPU lends memory to a pair it is
+// not part of: pull_relay.py), with this process's GPU given access to it, for its engines and wait kernels.
+int sx_malloc_on(int dev, uint64_t bytes, int uncached, uint64_t* out) {
+  int cur = 0;
+  if (hipGetDevice(&cur) != hipSuccess) return -2;
+  if (hipSetDevice(dev) != hipSuccess) return -3;
+  int rc = sx_malloc(bytes, uncached, out);
+  if (rc == 0 && (hipMemset((void*)*out, 0, bytes) != hipSuccess || hipDeviceSynchronize() != hipSuccess)) rc = -4;
+  hipSetDevice(cur);
+  if (rc != 0) return rc;
+  hipError_t e = hipDeviceEnablePeerAccess(dev, 0);
+  if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) return -5;
+  (void)hipGetLastError();
+  return 0;
+}
+
 int sx_memset(uint64_t ptr, int value, uint64_t bytes) {
   if (hipMemset((void*)ptr, value, bytes) != hipSuccess) return -1;
   return hipDeviceSynchronize() == hipSuccess ? 0 : -2;
@@ -343,6 +359,10 @@ struct Plan {
 
 std::vector<Plan> g_plans;
 
+// Signals a peer's engine releases (sx_signal_create_ipc / sx_signal_attach_ipc): the pull relay's copies wait on
+// them in the SDMA engine itself, so no kernel (and no compute unit) waits for a peer's data.
+std::vector<hsa_signal_t> g_signals;
+
 }  // namespace
 
 extern "C" {
@@ -373,6 +393,68 @@ int sx_plan_create(int n, const int* engines, const int* counts, const uint64_t*
     }
   g_plans.push_back(std::move(plan));
   return (int)g_plans.size() - 1;
+}
+
+// An IPC signal of this process, at value 1: its handle (sx_signal_handle_size bytes) goes to `handle`, the address of
+// its value to `value_ptr` (so an engine of this process can write it), and its id is returned (or a negative code).
+// A copy issued with sx_plan_issue_dep on it starts once its value is 0.
+int sx_signal_handle_size() { return (int)sizeof(hsa_amd_ipc_signal_t); }
+
+int sx_signal_create_ipc(void* handle, uint64_t* value_ptr) {
+  hsa_signal_t sig;
+  if (hsa_amd_signal_create(1, 0, nullptr, HSA_AMD_SIGNAL_IPC, &sig) != HSA_STATUS_SUCCESS) return -1;
+  if (hsa_amd_ipc_signal_create(sig, (hsa_amd_ipc_signal_t*)handle) != HSA_STATUS_SUCCESS) return -2;
+  volatile hsa_signal_value_t* v = nullptr;
+  if (hsa_amd_signal_value_pointer(sig, &v) != HSA_STATUS_SUCCESS) return -3;
+  *value_ptr = (uint64_t)v;
+  g_signals.push_back(sig);
+  return (int)g_signals.size() - 1;
+}
+
+// A GPU-only signal at value 1 (like the triggers: the SDMA engine polls its value, no host thread) whose value a
+// peer's engine can write: the allocation holding the value is exported with hsa_amd_ipc_memory_create.
+// `handle` gets the export (sizeof(hsa_amd_ipc_memory_t) bytes), `alloc_bytes` its size, `offset` the value's offset
+// in it, `value_ptr` the value's local address; returns the signal id (or a negative code).
+int sx_signal_create_gpu_exported(void* handle, uint64_t* alloc_bytes, uint64_t* offset, uint64_t* value_ptr) {
+  hsa_signal_t sig;
+  if (hsa_amd_signal_create(1, 0, nullptr, HSA_AMD_SIGNAL_AMD_GPU_ONLY, &sig) != HSA_STATUS_SUCCESS) return -1;
+  volatile hsa_signal_value_t* v = nullptr;
+  if (hsa_amd_signal_value_pointer(sig, &v) != HSA_STATUS_SUCCESS) return -2;
+  hsa_amd_pointer_info_t info = {};
+  info.size = sizeof(info);
+  if (hsa_amd_pointer_info((void*)v, &info, nullptr, nullptr, nullptr) != HSA_STATUS_SUCCESS) return -3;
+  void* base = info.agentBaseAddress ? info.agentBaseAddress : info.hostBaseAddress;
+  if (base == nullptr || info.sizeInBytes == 0) return -4;
+  hsa_status_t st = hsa_amd_ipc_memory_create(base, info.sizeInBytes, (hsa_amd_ipc_memory_t*)handle);
+  if (st != HSA_STATUS_SUCCESS) return -1000 - (int)st;
+  *alloc_bytes = info.sizeInBytes;
+  *offset = (uint64_t)v - (uint64_t)base;
+  *value_ptr = (uint64_t)v;
+  g_signals.push_back(sig);
+  return (int)g_signals.size() - 1;
+}
+
+int sx_hsa_ipc_handle_size() { return (int)sizeof(hsa_amd_ipc_memory_t); }
+
+// Maps a peer's hsa_amd_ipc_memory_create export of `bytes` into this process for this GPU; its base address to `out`.
+int sx_hsa_ipc_attach(const void* handle, uint64_t bytes, uint64_t* out) {
+  void* p = nullptr;
+  hsa_status_t st = hsa_amd_ipc_memory_attach((const hsa_amd_ipc_memory_t*)handle, bytes, 1, &g_local, &p);
+  if (st != HSA_STATUS_SUCCESS) return -1000 - (int)st;
+  *out = (uint64_t)p;
+  return 0;
+}
+
+// A peer's IPC signal, attached: the address of its value in this process (an engine of this process releases it by
+// writing 0 there) and its id.
+int sx_signal_attach_ipc(const void* handle, uint64_t* value_ptr) {
+  hsa_signal_t sig;
+  if (hsa_amd_ipc_signal_attach((const hsa_amd_ipc_signal_t*)handle, &sig) != HSA_STATUS_SUCCESS) return -1;
+  volatile hsa_signal_value_t* v = nullptr;
+  if (hsa_amd_signal_value_pointer(sig, &v) != HSA_STATUS_SUCCESS) return -2;
+  *value_ptr = (uint64_t)v;
+  g_signals.push_back(sig);
+  return (int)g_signals.size() - 1;
 }
 
 int sx_plan_free(int id) {
@@ -411,6 +493,68 @@ int sx_plan_issue(int slot, int k, int id, uint64_t src_base, uint64_t flag_src)
   return 0;
 }
 
+// As sx_plan_issue, but the plan's copies wait for signal `sig` (sx_signal_create_ipc) instead of a trigger: the
+// SDMA engine waits for a peer's engine to write the signal's value to 0. Takes the slot's completion signals as
+// sx_plan_issue does, so the slot's next sx_arm waits for these copies too.
+int sx_plan_issue_dep(int slot, int id, uint64_t src_base, uint64_t flag_src, int sig) {
+  if (id < 0 || id >= (int)g_plans.size() || !g_plans[id].live) return -2;
+  if (sig < 0 || sig >= (int)g_signals.size()) return -4;
+  const Plan& plan = g_plans[id];
+  Slot& s = g_slots[slot];
+  int n = (int)plan.peers.size(), n_flags = (int)plan.flags.size();
+  if (!grow(s.data, s.used_data + plan.copies) || !grow(s.flag, s.used_flags + n_flags)) return -3;
+  hsa_signal_t dep = g_signals[sig];
+  for (int i = 0; i < n; ++i) {
+    for (const PlanCopy& copy : plan.peers[i]) {
+      hsa_signal_t done = s.data[s.used_data++];
+      hsa_signal_store_relaxed(done, 1);
+      hsa_status_t st = hsa_amd_memory_async_copy_on_engine((void*)copy.dst, g_local,
+                                                            (const void*)(src_base + copy.src_offset), g_local,
+                                                            copy.bytes, 1, &dep, done,
+                                                            (hsa_amd_sdma_engine_id_t)(1u << plan.engines[i]), true);
+      if (st != HSA_STATUS_SUCCESS) return -100 - (int)st;
+    }
+    if (n_flags == 0) continue;
+    hsa_signal_t done = s.flag[s.used_flags++];
+    hsa_signal_store_relaxed(done, 1);
+    hsa_status_t st = hsa_amd_memory_async_copy_on_engine((void*)plan.flags[i], g_local, (const void*)flag_src, g_local,
+                                                          4, 1, &dep, done,
+                                                          (hsa_amd_sdma_engine_id_t)(1u << plan.engines[i]), true);
+    if (st != HSA_STATUS_SUCCESS) return -200 - (int)st;
+  }
+  return 0;
+}
+
+// As sx_plan_issue (trigger `k` of `slot`), and the copies also wait for signal `sig` in the engine: a credit the
+// receiver releases once the region they write is free again (fsdp_all_gather.py).
+int sx_plan_issue_trigger_dep(int slot, int k, int id, uint64_t src_base, uint64_t flag_src, int sig) {
+  if (id < 0 || id >= (int)g_plans.size() || !g_plans[id].live) return -2;
+  if (sig < 0 || sig >= (int)g_signals.size() || k < 0 || k >= kTriggers) return -4;
+  const Plan& plan = g_plans[id];
+  Slot& s = g_slots[slot];
+  int n = (int)plan.peers.size(), n_flags = (int)plan.flags.size();
+  if (!grow(s.data, s.used_data + plan.copies) || !grow(s.flag, s.used_flags + n_flags)) return -3;
+  hsa_signal_t deps[2] = {s.trigger[k], g_signals[sig]};
+  for (int i = 0; i < n; ++i) {
+    hsa_amd_sdma_engine_id_t eng = (hsa_amd_sdma_engine_id_t)(1u << plan.engines[i]);
+    for (const PlanCopy& copy : plan.peers[i]) {
+      hsa_signal_t done = s.data[s.used_data++];
+      hsa_signal_store_relaxed(done, 1);
+      hsa_status_t st = hsa_amd_memory_async_copy_on_engine((void*)copy.dst, g_local,
+                                                            (const void*)(src_base + copy.src_offset), g_local,
+                                                            copy.bytes, 2, deps, done, eng, true);
+      if (st != HSA_STATUS_SUCCESS) return -100 - (int)st;
+    }
+    if (n_flags == 0) continue;
+    hsa_signal_t done = s.flag[s.used_flags++];
+    hsa_signal_store_relaxed(done, 1);
+    hsa_status_t st = hsa_amd_memory_async_copy_on_engine((void*)plan.flags[i], g_local, (const void*)flag_src, g_local,
+                                                          4, 2, deps, done, eng, true);
+    if (st != HSA_STATUS_SUCCESS) return -200 - (int)st;
+  }
+  return 0;
+}
+
 // Enqueues on `stream` a wait until the `count` 32-bit flags at `words`, all but word `skip`,
 // read 1, then resets them to 0. After `seconds` a wait that is still missing flags is recorded
 // (sx_peek_error, sx_take_error); then the stream moves on, or with `block` stays held (for the
@@ -422,6 +566,21 @@ int sx_wait_flags(hipStream_t stream, uint64_t words, int count, int skip, doubl
   hipLaunchKernelGGL(wait_flags, dim3(1), dim3(1), 0, stream, (int*)words, count, skip, budget, g_error, tag, call,
                      block);
   return hipGetLastError() == hipSuccess ? 0 : -2;
+}
+
+// As sx_wait_flags, but the GPU's command processor waits (hipStreamWaitValue32 on each 32-bit word but `skip`
+// until it reads 1, then hipStreamWriteValue32 resets it): no kernel, so no compute unit is held while the
+// flags are outstanding (a resident one-wave spin kernel makes a GEMM sized to the whole GPU run a second wave).
+// The words must be fine-grained (uncached) memory, local or a peer's. No timeout: the stream waits until the
+// flags land.
+int sx_wait_flags_cp(hipStream_t stream, uint64_t words, int count, int skip) {
+  for (int i = 0; i < count; ++i)
+    if (i != skip && hipStreamWaitValue32(stream, (void*)(words + 4ull * i), 1, hipStreamWaitValueEq, 0xffffffffu) !=
+                         hipSuccess)
+      return -1;
+  for (int i = 0; i < count; ++i)
+    if (i != skip && hipStreamWriteValue32(stream, (void*)(words + 4ull * i), 0, 0) != hipSuccess) return -2;
+  return 0;
 }
 
 // As sx_take_error, without clearing the record: for a watchdog that polls it.

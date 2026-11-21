@@ -14,11 +14,13 @@ every copy to the partner into one slice per other GPU of the node:
 - receive (`wait(c)`): channel 2c + 1 from every other GPU: the forwarded slices and, behind
   the partner's flag, the direct slice.
 
-This needs every rank of the node to make the same exchange calls, with the same sizes, at the
-same time: each helper builds the forwards of the other pairs from its own routes (a route is a
-function of the sender's rank in its pair, which the helper substitutes). That holds when the
-world is made of 2-rank Ulysses groups running the same model step (TP x U2, CFG x U2); it is
-opt-in.
+This needs every rank of the world to make the same sequence of exchange calls at the same time:
+the world is made of 2-rank Ulysses groups running the same model step (TP x U2, CFG x U2); it is
+opt-in. The pairs' sizes may differ (CFG x U2 where the conditional pass carries text tokens the
+unconditional one does not). So every buffer and route request is agreed on the host, over a gloo
+group: a buffer gets the largest size any rank asked for, and when any rank has no route for the
+call, every rank rebuilds it and they swap their copies (destination buffer, offset, bytes), so
+each helper forwards the other pairs' slices as that pair cut them.
 
 Staging areas are indexed by the world transport's call slot, so a call's staged slices are not
 overwritten before the call _SLOTS calls later, by which time they have been forwarded (a sender
@@ -116,28 +118,46 @@ class RelayPair:
         ):
             raise RuntimeError(f"the SDMA relay needs every rank in a 2-rank group; partners {self.partner}")
         self._routes: Dict[tuple, _Route] = {}
+        # Host-side agreement on every buffer and route request (see the module docstring).
+        self._host = dist.new_group(dist.get_process_group_ranks(self.w.process_group), backend="gloo")
         logger.info(f"SDMA relay for pair {ranks} over {self.w.world} GPUs")
 
     # interface.PeerTransport --------------------------------------------------------------
+    def _every(self, mine):
+        every = [None] * self.w.world
+        dist.all_gather_object(every, mine, group=self._host)
+        return every
+
+    def _max(self, value: int) -> int:
+        t = torch.tensor([value], dtype=torch.int64)
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=self._host)
+        return int(t.item())
+
     def buffer(self, name: str, nbytes: int) -> transport.SharedBuffer:
-        return self.w.buffer("relay_" + name, nbytes)
+        # The largest size any rank asks for at this call, so every rank (re)creates the buffer together.
+        return self.w.buffer("relay_" + name, self._max(nbytes))
+
+    def _name_of(self, buf: transport.SharedBuffer) -> str:
+        for name, b in self.w._buffers.items():
+            if b is buf:
+                return name
+        raise RuntimeError("an SDMA relay route copies into a buffer the world transport does not hold")
 
     def route(self, key, build, signal):
         cached = self._routes.get((key, signal))
-        if cached is not None and cached.live:
+        # Rebuilt by every rank when any rank has to (another pair may have a new shape at this call).
+        if not self._max(int(cached is None or not cached.live)):
             return cached
         me, W = self.w.rank, self.w.world
-        by_pair_rank = {self.rank: build()[0]}
-        # A route is a function of the sender's rank in its pair: build the partner-rank one too.
-        saved = (self.rank, self.peers)
-        self.rank, self.peers = 1 - saved[0], [saved[0]]
-        try:
-            by_pair_rank[self.rank] = build()[0]
-        finally:
-            self.rank, self.peers = saved
+        own = build()[0]
+        # Every rank's copies to its partner (each rank builds this route at the same call), so that a helper
+        # forwards another pair's slices as that pair cut them, whatever its sizes.
+        every = self._every([(self._name_of(dst), dst_off, n) for _, dst, dst_off, n in own])
+        theirs = [[(None, self.w._buffers[name], dst_off, n) for name, dst_off, n in copies] for copies in every]
+        theirs[me] = own
 
         def copies_of(sender):
-            return by_pair_rank[self.pair_rank[sender]]
+            return theirs[sender]
 
         # Staging at each helper: [slot][sender] areas of the largest per-sender size.
         def staged_bytes(sender, helper):
@@ -154,7 +174,7 @@ class RelayPair:
         # routes still on it rebuild), so memory stays bounded by the largest route per lane.
         lane = key[1:] if isinstance(key, tuple) and len(key) > 1 else key
         r.stage = self.w.buffer(f"relay_stage_{lane!r}_{signal}", transport._SLOTS * W * per_sender)
-        r.buffers = list({id(c[1]): c[1] for rb in by_pair_rank.values() for c in rb}.values())
+        r.buffers = list({id(c[1]): c[1] for rb in theirs for c in rb}.values())
 
         def stage_offset(slot, sender, j, helper):
             before = sum(
@@ -164,6 +184,12 @@ class RelayPair:
 
         a = None if signal is None else 2 * signal
         b = None if signal is None else 2 * signal + 1
+        # A rank whose own route is unchanged rebuilds too: the forwards of another pair may have changed.
+        for slot in range(transport._SLOTS):
+            for k in ((("relay1", key, signal, slot), a), (("relay2", key, signal, slot), b)):
+                old = self.w._routes.pop(k, None)
+                if old is not None:
+                    old.free()
         for slot in range(transport._SLOTS):
 
             def hop1(slot=slot):

@@ -55,7 +55,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.distributed as dist
 
-from xfuser.core.distributed.sdma import interface, relay, transport
+from xfuser.core.distributed.sdma import interface, pull_relay, relay, transport
 
 # What `attend` gets: one head group's tensors, each a [b, h, rows, d] view of a bshd
 # tensor (Q, K, V, then the extras); it returns the group's attention output as
@@ -357,7 +357,10 @@ def _out_copies(g, ex, gi, outbox, elt):
 
 
 def _transport(process_group: dist.ProcessGroup) -> interface.PeerTransport:
-    """The group's transport: the relayed one for a 2-rank group with XDIT_ULYSSES_SDMA_RELAY=1."""
+    """The group's transport: for a 2-rank group, relayed with XDIT_ULYSSES_SDMA_RELAY=1 (helpers forward) or
+    =pull (a lent buffer on a third GPU, pulled by the receiver)."""
+    if pull_relay.applies(process_group):
+        return pull_relay.pair_for(process_group)
     if relay.applies(process_group):
         return relay.relay_for(process_group)
     return transport.group_for(process_group)

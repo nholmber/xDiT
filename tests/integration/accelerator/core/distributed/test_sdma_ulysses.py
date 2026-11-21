@@ -1,5 +1,7 @@
 """Ulysses attention with its all-to-alls on SDMA engines: the exchange, and USP on it."""
 
+import os
+
 import pytest
 
 pytestmark = [pytest.mark.multi_gpu, pytest.mark.rocm]
@@ -182,7 +184,7 @@ def test_sdma_exchange_under_cfg_parallel(accelerator_ranks, world_size):
     accelerator_ranks(_exchange_worker, world_size=world_size, timeout=600, args=(2, False))
 
 
-def _relay_worker(rank, world_size, init_method, cfg, tp):
+def _relay_worker(rank, world_size, init_method, cfg, tp, mode="1"):
     import os
 
     import torch
@@ -197,9 +199,11 @@ def _relay_worker(rank, world_size, init_method, cfg, tp):
         initialize_runtime_state,
     )
     from xfuser.core.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
-    from xfuser.core.distributed.sdma import relay, ulysses
+    from xfuser.core.distributed.sdma import pull_relay, relay, ulysses
 
-    os.environ["XDIT_ULYSSES_SDMA_RELAY"] = "1"
+    os.environ["XDIT_ULYSSES_SDMA_RELAY"] = mode
+    if mode == "pull":
+        os.environ["XDIT_ULYSSES_SDMA_RELAY_MIN_BYTES"] = "0"  # relay even the test's small copies
     try:
         torch.cuda.set_device(rank)
         init_distributed_environment(
@@ -213,12 +217,25 @@ def _relay_worker(rank, world_size, init_method, cfg, tp):
         get_runtime_state().set_attention_backend(BACKEND)
         group = PROCESS_GROUP.ULYSSES_PG
         assert dist.get_world_size(group) == 2
-        assert isinstance(ulysses._transport(group), relay.RelayPair)
+        assert isinstance(ulysses._transport(group), pull_relay.PullRelayPair if mode == "pull" else relay.RelayPair)
         # Every rank makes the same calls, as the relay requires; each checks every element.
         for index, case in enumerate(EXCHANGES):
             for call in range(3):
                 wrong = exchange_mismatches(group, case, 10 * index + call)
                 assert wrong == 0, f"relayed {case}: {wrong} wrong elements"
+        if mode == "pull":
+            # Pairs need not make the same calls: the CFG pairs run different sizes (and the first pair runs extra
+            # calls), each relaying through the other's GPUs.
+            from xfuser.core.distributed.parallel_state import get_classifier_free_guidance_rank
+
+            extra = 40 * get_classifier_free_guidance_rank()
+            for index, (b, s_q, s_kv, *rest) in enumerate(EXCHANGES):
+                for call in range(2 + (extra == 0)):
+                    case = (b, s_q + extra, s_kv + extra, *rest)
+                    wrong = exchange_mismatches(group, case, 2000 + 10 * index + call)
+                    assert wrong == 0, f"pull-relayed, pair sizes differ {case}: {wrong} wrong elements"
+            dist.barrier()
+            return
         world = ulysses._transport(group).w
 
         def staging():
@@ -233,6 +250,17 @@ def _relay_worker(rank, world_size, init_method, cfg, tp):
         # buffers are not keyed by shape, and revisiting shapes adds none
         assert not any("Exchange(" in name for name in lanes), f"relay staging keyed by shape: {lanes[:2]}"
         assert staging() == lanes, f"relay staging grew from {len(lanes)} to {len(staging())} buffers"
+        if cfg > 1:
+            # Pairs of different sizes at the same calls (Ideogram's conditional pass carries text rows the
+            # unconditional one has not): each helper forwards the other pair's slices as that pair cut them.
+            from xfuser.core.distributed.parallel_state import get_classifier_free_guidance_rank
+
+            extra = 40 * get_classifier_free_guidance_rank()
+            for index, (b, s_q, s_kv, *rest) in enumerate(EXCHANGES):
+                for call in range(2):
+                    case = (b, s_q + extra, s_kv + extra, *rest)
+                    wrong = exchange_mismatches(group, case, 2000 + 10 * index + call)
+                    assert wrong == 0, f"relayed, pair sizes differ {case}: {wrong} wrong elements"
         dist.barrier()
     finally:
         destroy_model_parallel()
@@ -243,6 +271,12 @@ def _relay_worker(rank, world_size, init_method, cfg, tp):
 def test_relayed_pair_exchange(accelerator_ranks, world_size, cfg, tp):
     """2-rank Ulysses groups (CFG x U2, TP4 x U2) relayed through every GPU (XDIT_ULYSSES_SDMA_RELAY=1)."""
     accelerator_ranks(_relay_worker, world_size=world_size, timeout=900, args=(cfg, tp))
+
+
+@pytest.mark.parametrize("world_size, cfg, tp", [(4, 2, 1), (8, 1, 4)])
+def test_pull_relayed_pair_exchange(accelerator_ranks, world_size, cfg, tp):
+    """2-rank Ulysses groups whose relayed bytes go via a buffer lent on another GPU (XDIT_ULYSSES_SDMA_RELAY=pull)."""
+    accelerator_ranks(_relay_worker, world_size=world_size, timeout=900, args=(cfg, tp, "pull"))
 
 
 def test_packed_exchange_over_rccl(accelerator_ranks):
@@ -651,5 +685,8 @@ def _lost_flag_worker(rank, world_size, init_method):
         destroy_distributed_environment()
 
 
+@pytest.mark.skipif(
+    os.environ.get("XDIT_SDMA_CP_WAIT") == "1", reason="command-processor waits have no timeout to report a lost flag"
+)
 def test_lost_flag_is_reported_by_the_rank_that_waited(accelerator_ranks):
     accelerator_ranks(_lost_flag_worker, world_size=2, timeout=300)

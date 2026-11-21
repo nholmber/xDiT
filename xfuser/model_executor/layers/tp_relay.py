@@ -16,6 +16,11 @@ n + 2 into a parity only after it received every peer's call n + 1 data, which e
 sends only after it finished with call n's (stream order), so nobody writes a buffer still in use.
 All ranks of the node make the same relayed calls in the same order (both TP groups run the same step).
 
+Pull mode (XDIT_TP_RELAY_PULL=1, as ROCm/aiter#6236's relay: the helper only lends memory): the destination,
+not the helper, moves the second hop. Per piece it waits on the helper's staging flags (remote, uncached flag
+buffers) from a side stream, then its own engine for that helper pulls every sender's staged piece into place
+and sets its local data words. Helpers issue nothing for the other group.
+
 All-gather + GEMM (FP8): the row scales go first, direct; chunk c of every rank's rows lands in P = 1 + H
 pieces, and the persistent kernel (layers/flydsl_tp_gemm.py, "ag") waits in-kernel for all P pieces of a
 (chunk, rank) before its tiles. GEMM + reduce-scatter (FP8): the persistent kernel ("rs") writes partial
@@ -26,6 +31,7 @@ reduces a chunk in fp32 once all pieces from all senders are in. Rows per rank m
 remainder (chunk_rows), so a tile count with no divisor (Wan: 37) still pipelines.
 """
 
+import ctypes
 import dataclasses
 import functools
 from typing import Dict, Optional
@@ -282,10 +288,13 @@ class TPRelay:
         self.want_chunks = int(envs.environment_variables["XDIT_TP_RELAY_CHUNKS"]())
         self.rs_fp8 = envs.environment_variables["XDIT_TP_RELAY_RS_FP8"]().strip() == "1"
         self.n = {"ag": 0, "rs": 0}  # calls per op kind (flag values)
+        import os
+
+        self.pull = os.environ.get("XDIT_TP_RELAY_PULL", "0") == "1"
         self._plans: Dict[tuple, dict] = {}
         dev = torch.device("cuda", torch.cuda.current_device())
         self.values = torch.arange(_VALUES, dtype=torch.int32, device=dev)  # flag source of call n: values[n]
-        logger.info(f"TP relay for group {self.ranks} through {self.helpers}")
+        logger.info(f"TP relay ({'pull' if self.pull else 'forward'}) for group {self.ranks} through {self.helpers}")
 
     def chunks(self, rows: int) -> Optional[int]:
         """Pieces for `rows` rows per rank: XDIT_TP_RELAY_CHUNKS, at most one per 256-row tile and at most what fits
@@ -317,12 +326,71 @@ class TPRelay:
 
     @staticmethod
     def _free(entry):
+        from xfuser.core.distributed.sdma import transport
+
         for pp in entry["par"]:
             plans = [*pp["chunks"], *(x for row in pp["fwd"] for x in row)]
             if "scale" in pp:
                 plans.append(pp["scale"])
             for plan in plans:
                 plan.free()
+            for pid in pp.get("pull", []):
+                transport.load().sx_plan_free(pid)
+
+    def _flags_buffer(self, name: str, nbytes: int):
+        # Pull mode polls the helpers' flag words from the destination: uncached, so remote polls see the writes.
+        return self.w._buffer(name, nbytes, uncached=True) if self.pull else self.w.buffer(name, nbytes)
+
+    def _pull_plans(self, C: int, pieces, stage_at, dst_at, data: int, f) -> list:
+        """Pull mode, per chunk c: one raw plan whose entries pull every sender's staged piece of chunk c from each
+        helper (on this rank's engine for that helper) into this rank's receive buffer, each entry then setting
+        this rank's data word of (c, sender, piece)."""
+        from xfuser.core.distributed.sdma.pull_relay import _plan
+
+        engines_of = self.w.engine_plan()
+        me, Wt = self.me, self.Wt
+        out = []
+        for c in range(C):
+            engines, copies, flags = [], [], []
+            for j, q in enumerate(self.helpers):
+                off, size = pieces[c][1 + j]
+                for i in range(Wt):
+                    if i == me:
+                        continue
+                    engines.append(engines_of[q])
+                    copies.append([(stage_at(q, i, me, c), dst_at(i, c, off), size)])
+                    flags.append(self.base(f, self.w.rank) + (data + (c * Wt + i) * self.P + 1 + j) * 4)
+            out.append(_plan(engines, copies, flags))
+        return out
+
+    def _pull_waits(self, C: int, f, stage: int, nwords: int):
+        """Pull mode: each helper's flag words as a tensor here, and per chunk the stage words to wait on there."""
+        from xfuser.core.distributed.sdma import transport
+
+        dev = self.values.device
+        remote = [transport.device_bytes(self.base(f, q), nwords * 4, dev).view(torch.int32) for q in self.helpers]
+        idx = [
+            torch.tensor([stage + c * self.Wt + i for i in range(self.Wt) if i != self.me], dtype=torch.int32, device=dev)
+            for c in range(C)
+        ]
+        return remote, idx
+
+    def _pull_chunk(self, call, e, pp, c: int, n: int, flag_src: int, side) -> None:
+        """Pull mode: on `side`, wait until every sender's piece c is staged at every helper, then pull them."""
+        from xfuser.core.distributed.sdma import transport
+
+        lib = transport.load()
+        wait = _wait_kernel()
+        remote, idx = e["pull_waits"]
+        with torch.cuda.stream(side):
+            for flags in remote:
+                wait[(1,)](flags, idx[c], idx[c].numel(), n)
+        k = call._sends
+        if k >= transport._TRIGGERS:
+            raise ValueError(f"at most {transport._TRIGGERS} sends per call")
+        transport._check(lib.sx_plan_issue(call.slot, k, pp["pull"][c], 0, flag_src), "sx_plan_issue")
+        transport._check(lib.sx_release(call.slot, k, ctypes.c_void_p(side.cuda_stream)), "sx_release")
+        call._sends += 1
 
     # -- all-gather + GEMM ------------------------------------------------------------------------------
     def _ag(self, rows: int, K: int, C: int, chunk_scales: bool = False) -> dict:
@@ -340,7 +408,7 @@ class TPRelay:
             "x": w.buffer("tp_relay_ag_x", 2 * xh),
             "s": w.buffer("tp_relay_ag_s", 2 * sh),
             "stage": w.buffer("tp_relay_ag_stage", 2 * sth),  # [parity][client sender][client dest][c]
-            "flags": w.buffer("tp_relay_ag_flags", self._flags_layout(C)[-1] * 4),
+            "flags": self._flags_buffer("tp_relay_ag_flags", self._flags_layout(C)[-1] * 4),
         }
         cached = self._plans.get(key)
         if cached is not None and all(cached["bufs"][k] is b and b.live for k, b in bufs.items()):
@@ -388,6 +456,12 @@ class TPRelay:
                         copies.append([(coff[c] + off, stage_at(q, me, d, c), size) for d in range(Wt) if d != me])
                         flags.append(flag(q, stage + c * Wt + me))
                 chunk_plans.append(self._plan(copies, flags))
+            if self.pull:
+                pull = self._pull_plans(
+                    C, pieces, stage_at, lambda i, c, off, x_at=x_at: x_at(w.rank, i, c, off), data, f
+                )
+                par_plans.append({"scale": scale_plan, "chunks": chunk_plans, "fwd": [], "pull": pull})
+                continue
             # as helper `me` of the other group: forward client sender i's pieces of chunk c to each client dest
             fwd = []
             for c in range(C):
@@ -420,6 +494,7 @@ class TPRelay:
                 torch.tensor([stage + c * Wt + i], dtype=torch.int32, device=dev) for c in range(C) for i in range(Wt)
             ],
             "chunk_scales": chunk_scales,
+            "pull_waits": self._pull_waits(C, f, stage, self._flags_layout(C)[-1]) if self.pull else None,
             "own_words": torch.tensor(
                 [data + (c * Wt + me) * P + k for c in range(C) for k in range(P)] + [scale + me],
                 dtype=torch.long,
@@ -466,6 +541,9 @@ class TPRelay:
         send of that piece: forwards of a later piece ahead of it would wait for peers' sends queued behind their
         own forwards of that piece (a cycle)."""
         e, n, Wt, side = st["e"], st["n"], self.Wt, st["side"]
+        if self.pull:
+            self._pull_chunk(st["call"], e, st["pp"], c, n, st["flag_src"], side)
+            return
         stage_all = e["bufs"]["stage"].local  # forward plans hold offsets from the buffer start (parity included)
         wait = _wait_kernel()
         with torch.cuda.stream(side):
@@ -571,7 +649,7 @@ class TPRelay:
         bufs = {
             "recv": w.buffer("tp_relay_rs_recv", 2 * rh),  # [parity][sender][rows] at each destination
             "stage": w.buffer("tp_relay_rs_stage", 2 * sth),
-            "flags": w.buffer("tp_relay_rs_flags", self._flags_layout(C)[-1] * 4),
+            "flags": self._flags_buffer("tp_relay_rs_flags", self._flags_layout(C)[-1] * 4),
         }
         if fp8:
             bufs["rscale"] = w.buffer("tp_relay_rs_rscale", 2 * rsh)  # [parity][sender][rows][N / 256]
@@ -620,6 +698,12 @@ class TPRelay:
                         copies.append([(src(d, c) + off, stage_at(q, me, d, c), size) for d in range(Wt) if d != me])
                         flags.append(flag(q, stage + c * Wt + me))
                 chunk_plans.append(self._plan(copies, flags))
+            if self.pull:
+                pull = self._pull_plans(
+                    C, pieces, stage_at, lambda i, c, off, recv_at=recv_at: recv_at(w.rank, i, c, off), data, f
+                )
+                par_plans.append({"chunks": chunk_plans, "fwd": [], "pull": pull})
+                continue
             fwd = []
             for c in range(C):
                 off, size = pieces[c][1 + me]
@@ -661,6 +745,7 @@ class TPRelay:
                 for c in range(C)
             ],
             "cnt": torch.zeros(C * Wt, dtype=torch.int32, device=dev),  # tile counters [c][dest], zeroed per call
+            "pull_waits": self._pull_waits(C, f, stage, self._flags_layout(C)[-1]) if self.pull else None,
         }
         self._plans[key] = entry
         return entry
@@ -735,6 +820,9 @@ class TPRelay:
                         partials, q8, sc, rows, r0, nr, n_rows, self.me, N, NB, ROWS=8, BLOCK=256, num_warps=8
                     )
                 call.send(pp["chunks"][c], st["send"], post, flag_src)
+            if self.pull:
+                self._pull_chunk(call, e, pp, c, n, flag_src, side)
+                continue
             with torch.cuda.stream(side):
                 for i in range(Wt):
                     wait[(1,)](flags, e["stage_idx"][c * Wt + i], 1, n)

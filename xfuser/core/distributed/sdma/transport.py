@@ -164,6 +164,7 @@ def load():
         "sx_bus_of": [i],
         "sx_malloc": [u64, i, u64p],
         "sx_free": [u64],
+        "sx_malloc_on": [i, u64, i, u64p],
         "sx_memset": [u64, i, u64],
         "sx_ipc_handle_size": [],
         "sx_ipc_get": [u64, vp],
@@ -174,7 +175,16 @@ def load():
         "sx_plan_create": [i, ip, ip, u64p, u64p, u64p, u64p],
         "sx_plan_free": [i],
         "sx_plan_issue": [i, i, i, u64, u64],
+        "sx_plan_issue_dep": [i, i, u64, u64, i],
+        "sx_plan_issue_trigger_dep": [i, i, i, u64, u64, i],
+        "sx_signal_handle_size": [],
+        "sx_signal_create_ipc": [vp, u64p],
+        "sx_signal_attach_ipc": [vp, u64p],
+        "sx_signal_create_gpu_exported": [vp, u64p, u64p, u64p],
+        "sx_hsa_ipc_handle_size": [],
+        "sx_hsa_ipc_attach": [vp, u64, u64p],
         "sx_wait_flags": [vp, u64, i, i, dbl, i, i, i],
+        "sx_wait_flags_cp": [vp, u64, i, i],
         "sx_take_error": [ip, ip, u64p],
         "sx_peek_error": [ip, ip, u64p],
         "sx_debug_drop_flag": [i, i, i],
@@ -420,6 +430,12 @@ def _start_watchdog(lib) -> None:
     _watchdog.start()
 
 
+def cp_wait() -> bool:
+    """XDIT_SDMA_CP_WAIT=1: flag waits are command-processor waits (sx_wait_flags_cp), with no kernel holding a compute
+    unit, and no timeout."""
+    return os.environ.get("XDIT_SDMA_CP_WAIT", "0") == "1"
+
+
 def raise_if_waits_gave_up() -> None:
     """Raise if a bounded flag wait of an earlier call on this process ran out."""
     tag, call, missing = ctypes.c_int(), ctypes.c_int(), ctypes.c_uint64()
@@ -466,6 +482,15 @@ class Call:
         g = self._g
         if g.world > MAX_FLAGS_PER_WAIT:
             raise ValueError(f"at most {MAX_FLAGS_PER_WAIT} ranks per group; got {g.world}")
+        if cp_wait():
+            _check(
+                load().sx_wait_flags_cp(
+                    ctypes.c_void_p(stream.cuda_stream), g._flags.ptr + channel * g.world * 4, g.world, g.rank
+                ),
+                "sx_wait_flags_cp",
+            )
+            self._waits += 1
+            return
         _check(
             load().sx_wait_flags(
                 ctypes.c_void_p(stream.cuda_stream),

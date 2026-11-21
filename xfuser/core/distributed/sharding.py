@@ -17,6 +17,7 @@ Functions:
 """
 
 import logging
+import os
 from functools import partial
 from typing import Callable, Iterable, Optional, Union
 
@@ -382,7 +383,11 @@ def shard_component(
         - Each element in wrap_attrs becomes a separate FSDP unit
         - Requires PyTorch distributed to be initialized before calling
     """
-    use_fsdp2 = quantize_fn is not None or memory_efficient_init or meta_init or load_block_fn is not None
+    use_fsdp2 = (
+        quantize_fn is not None or memory_efficient_init or meta_init or load_block_fn is not None
+        or os.environ.get("XDIT_FSDP2", "0") == "1"
+        or os.environ.get("XDIT_FSDP_SDMA", "0") != "0"
+    )
 
     # ``device_id`` used to mean "index on the current CUDA device". Resolve it to an explicit
     # device of the accelerator in use, so NPU/MUSA ranks are not handed to FSDP as CUDA indices.
@@ -495,6 +500,11 @@ def shard_component(
         ignored_params=ignore_fp32(component),
     )
     _keep_recording_outputs(component)
+    if os.environ.get("XDIT_FSDP_SDMA", "0") != "0":
+        from xfuser.core.distributed.sdma import fsdp_all_gather  # noqa: PLC0415
+
+        on = [fsdp_all_gather.install(m) for m in (*wrapped_blocks, component)]
+        logger.warning(f"FSDP all-gathers on SDMA: {sum(on)} of {len(on)} modules")
 
     # FSDP2 forward prefetch: each block pre-fetches the next two blocks' all-gathers
     # so communication overlaps with compute. The first block has no predecessor to
